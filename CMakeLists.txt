@@ -64,9 +64,13 @@ add_library(libwsc
 
 target_include_directories(libwsc
   PUBLIC
+<<<<<<< HEAD
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:include/libwsc>
   PRIVATE
+=======
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libwsc>
+>>>>>>> 0460557 (Compile examples)
     ${LIBEVENT_INCLUDE_DIRS}
 )
 
@@ -110,6 +114,15 @@ set_target_properties(libwsc PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
 )
+
+# Build example executables
+add_executable(autobahn examples/autobahn.cpp)
+target_include_directories(autobahn PRIVATE libwsc)
+target_link_libraries(autobahn libwsc pthread)
+
+add_executable(threads examples/threads.cpp)
+target_include_directories(threads PRIVATE libwsc)
+target_link_libraries(threads libwsc pthread)
 
 install(TARGETS libwsc
   EXPORT libwscTargets

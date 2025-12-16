@@ -13,7 +13,7 @@ project(libwsc
 set (CMAKE_CXX_STANDARD 11)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(USE_TLS "Enable TLS/SSL support using OpenSSL" OFF)
+option(USE_TLS "Enable TLS/SSL support using OpenSSL" ON)
 option(LIBWSC_USE_DEBUG "Enable debug (verbose) output" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries instead of static ones" OFF)
 

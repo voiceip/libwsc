@@ -27,6 +27,10 @@ endif()
 find_package(Libevent REQUIRED COMPONENTS ${LIBEVENT_COMPONENTS})
 find_package(ZLIB REQUIRED)
 
+# Find libwebsockets for WebSocketClientWrapper
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBWEBSOCKETS REQUIRED libwebsockets)
+
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -37,10 +41,12 @@ endif()
 
 set (LIBWSC_SOURCES 
   libwsc/WebSocketClient.cpp 
+  libwsc/WebSocketClientWrapper.cpp
   libwsc/Utf8Validator.cpp 
   libwsc/base64.cpp)
 set (LIBWSC_HEADERS 
   libwsc/WebSocketClient.h
+  libwsc/WebSocketClientWrapper.h
   libwsc/Logger.h
   libwsc/Utf8Validator.h
   libwsc/base64.h
@@ -57,12 +63,14 @@ target_include_directories(libwsc
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libwsc>
   PRIVATE
     ${LIBEVENT_INCLUDE_DIRS}
+    ${LIBWEBSOCKETS_INCLUDE_DIRS}
 )
 
 target_link_libraries(libwsc
   PRIVATE
     ${LIBEVENT_LIBRARIES}
     ZLIB::ZLIB
+    ${LIBWEBSOCKETS_LIBRARIES}
 )
 
 if (LIBWSC_USE_DEBUG)

@@ -272,7 +272,7 @@ void WebSocketClient::connect() {
  * - Finally, sets state to DISCONNECTED and notifies waiters again.
  */
 void WebSocketClient::disconnect() {
-    log_debug("disconnect: entering");
+    log_info("VIETHQ version 1.1 WebSocketClient disconnect: entering");
 
     auto current_state = connection_state.load(std::memory_order_acquire);
     if (current_state == ConnectionState::DISCONNECTING || current_state == ConnectionState::DISCONNECTED) {
@@ -291,21 +291,62 @@ void WebSocketClient::disconnect() {
                         [&]{ return got_remote_close.load(); });
     }
 
+    // Set cleanup_complete EARLY to prevent callbacks from accessing destroyed resources
+    // This must be done BEFORE canceling events to ensure callbacks see the flag
+    cleanup_complete.store(true, std::memory_order_release);
+
     if (base && running.load()) {
-        bufferevent_lock(m_bev);
-        bufferevent_disable(m_bev, EV_READ | EV_WRITE);
-        // schedule a zero-timeout no-op so the loop definitely wakes
-        struct timeval zero = {0,0};
-        event_base_once(base,
-                        /*fd*/-1,
-                        EV_TIMEOUT,
-                        /*cb*/ [](evutil_socket_t, short, void*) {
-                        log_debug("zero-timeout callback fired");
-                        },
-                        /*arg*/ nullptr,
-                        &zero);
-        event_base_loopexit(base, nullptr);
-        bufferevent_unlock(m_bev);
+        // Cancel timeout and ping events AFTER setting cleanup_complete
+        // This ensures any callback that runs will see cleanup_complete=true and exit early
+        // This must be done before loopexit to ensure events are removed from event_base
+        if (timeout_event) {
+            event_del(timeout_event);
+            log_debug("Cancelled timeout event");
+        }
+        if (ping_event) {
+            event_del(ping_event);
+            log_debug("Cancelled ping event");
+        }
+        
+        // Wrap bufferevent_lock in try-catch to handle destroyed bufferevent
+        if (m_bev) {
+            try {
+                bufferevent_lock(m_bev);
+                bufferevent_disable(m_bev, EV_READ | EV_WRITE);
+                // schedule a zero-timeout no-op so the loop definitely wakes
+                struct timeval zero = {0,0};
+                event_base_once(base,
+                                /*fd*/-1,
+                                EV_TIMEOUT,
+                                /*cb*/ [](evutil_socket_t, short, void*) {
+                                log_debug("zero-timeout callback fired");
+                                },
+                                /*arg*/ nullptr,
+                                &zero);
+                event_base_loopexit(base, nullptr);
+                bufferevent_unlock(m_bev);
+            } catch (const std::exception& e) {
+                log_error("Exception in disconnect() when locking bufferevent: %s", e.what());
+                // Try to unlock if we locked it
+                if (m_bev) {
+                    try {
+                        bufferevent_unlock(m_bev);
+                    } catch (...) {
+                        // Ignore unlock errors
+                    }
+                }
+            } catch (...) {
+                log_error("Unknown exception in disconnect() when locking bufferevent");
+                // Try to unlock if we locked it
+                if (m_bev) {
+                    try {
+                        bufferevent_unlock(m_bev);
+                    } catch (...) {
+                        // Ignore unlock errors
+                    }
+                }
+            }
+        }
     }
 
     auto self = this;
@@ -324,10 +365,21 @@ void WebSocketClient::disconnect() {
         }
 
         if (self->event_thread && self->event_thread->joinable()) {
-          self->event_thread->join();
+          try {
+            self->event_thread->join();
+          } catch (const std::system_error& e) {
+            log_error("VietHQ System error joining event thread in helper: %s (code: %d)", e.what(), e.code().value());
+          } catch (const std::exception& e) {
+            log_error("VietHQ version 1.1 Exception joining event thread in helper: %s", e.what());
+          } catch (...) {
+            log_error("VietHQ Unknown exception joining event thread in helper");
+          }
         }
-        delete self->event_thread;
-        self->event_thread = nullptr;
+        
+        if (self->event_thread) {
+          delete self->event_thread;
+          self->event_thread = nullptr;
+        }
 
         self->cleanup();
 
@@ -342,12 +394,22 @@ void WebSocketClient::disconnect() {
     // Otherwise—called from a non‐event thread—do the normal join+cleanup
     if (event_thread && event_thread->joinable() ) {
       log_debug("Waiting for event thread to join...");
-      event_thread->join();
-      log_debug("Event thread joined");
+      try {
+        event_thread->join();
+        log_debug("Event thread joined");
+      } catch (const std::system_error& e) {
+        log_error("System error joining event thread: %s (code: %d)", e.what(), e.code().value());
+      } catch (const std::exception& e) {
+        log_error("Exception joining event thread: %s", e.what());
+      } catch (...) {
+        log_error("Unknown exception joining event thread");
+      }
     }
 
-    delete event_thread;
-    event_thread = nullptr;
+    if (event_thread) {
+      delete event_thread;
+      event_thread = nullptr;
+    }
 
     cleanup();
 
@@ -380,6 +442,12 @@ bool WebSocketClient::isConnected() {
 bool WebSocketClient::sendData(const void* data,
                                size_t length,
                                MessageType type) {
+    // Check if object is being destroyed FIRST
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("sendData: object is being destroyed, ignoring send request");
+        return false;
+    }
+
     if (!m_bev) {
         log_error("No bufferevent—cannot send");
         return false;
@@ -390,6 +458,11 @@ bool WebSocketClient::sendData(const void* data,
     // Queue
     if (state == ConnectionState::CONNECTING) {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
+        // Double-check cleanup_complete after acquiring lock
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("sendData: object is being destroyed (checked after queue lock), ignoring");
+            return false;
+        }
         if (send_queue.size() >= MAX_QUEUE_SIZE) {
             log_error("Send queue full—dropping packet");
             return false;
@@ -417,18 +490,71 @@ bool WebSocketClient::sendData(const void* data,
             log_error("WebSocket not fully upgraded yet");
             return false;
         }
-        bufferevent_lock(m_bev);
-
-        evbuffer* output = bufferevent_get_output(m_bev);
-        if (!output) {
+        
+        // CRITICAL: Check cleanup_complete BEFORE attempting to lock bufferevent
+        // This prevents deadlock when disconnect() is freeing bufferevent
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("sendData: object is being destroyed (checked before lock), ignoring");
             return false;
         }
+        
+        // Double-check m_bev is still valid
+        if (!m_bev) {
+            log_debug("sendData: bufferevent is null, ignoring");
+            return false;
+        }
+        
+        // Wrap bufferevent operations in try-catch to handle destroyed bufferevent
+        try {
+            // Final check before lock - another thread may have set cleanup_complete
+            if (cleanup_complete.load(std::memory_order_acquire)) {
+                log_debug("sendData: object is being destroyed (final check before lock), ignoring");
+                return false;
+            }
+            
+            bufferevent_lock(m_bev);
+            
+            // Check again after lock (bufferevent may have been freed by another thread)
+            if (cleanup_complete.load(std::memory_order_acquire) || !m_bev) {
+                bufferevent_unlock(m_bev);
+                log_debug("sendData: object is being destroyed (checked after lock), ignoring");
+                return false;
+            }
 
-        send(output, data, length, type);
+            evbuffer* output = bufferevent_get_output(m_bev);
+            if (!output) {
+                bufferevent_unlock(m_bev);
+                return false;
+            }
 
-        bufferevent_unlock(m_bev);
+            send(output, data, length, type);
 
-        return true;
+            bufferevent_unlock(m_bev);
+
+            return true;
+        } catch (const std::exception& e) {
+            log_error("Exception in sendData when locking bufferevent: %s", e.what());
+            // Try to unlock if we locked it
+            if (m_bev) {
+                try {
+                    bufferevent_unlock(m_bev);
+                } catch (...) {
+                    // Ignore unlock errors
+                }
+            }
+            return false;
+        } catch (...) {
+            log_error("Unknown exception in sendData when locking bufferevent");
+            // Try to unlock if we locked it
+            if (m_bev) {
+                try {
+                    bufferevent_unlock(m_bev);
+                } catch (...) {
+                    // Ignore unlock errors
+                }
+            }
+            return false;
+        }
     }
 
     log_error("Cannot send in state %d", int(state));
@@ -505,14 +631,41 @@ void WebSocketClient::setOpenCallback(OpenCallback callback) {
 
 // Invoke the error callback (or log if none set)
 void WebSocketClient::sendError(int error_code, const std::string& error_message) {
-    ErrorCallback callback;
-    {
-        std::lock_guard<std::mutex> lock(callback_mutex);
-        callback = error_callback;
+    // CRITICAL: Check cleanup_complete FIRST before any operations
+    // This prevents accessing destroyed mutex or callbacks
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_info("sendError: object is being destroyed, ignoring error: %s", error_message.c_str());
+        return;
     }
 
+    ErrorCallback callback;
+    
+    // Use try_lock to avoid blocking if mutex is being destroyed
+    // If we can't lock immediately, skip the callback
+    std::unique_lock<std::mutex> lock(callback_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        // Could not acquire lock - object may be being destroyed
+        log_debug("sendError: could not acquire callback_mutex lock, ignoring error");
+        return;
+    }
+    
+    // Double-check cleanup_complete after acquiring lock
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("sendError: object is being destroyed (checked after lock), ignoring error");
+        return;
+    }
+    
+    callback = error_callback;
+    lock.unlock(); // Release lock before calling callback to avoid deadlock
+
     if (callback) {
-        callback(error_code, error_message);
+        try {
+            callback(error_code, error_message);
+        } catch (const std::exception& e) {
+            log_error("Exception in error callback: %s", e.what());
+        } catch (...) {
+            log_error("Unknown exception in error callback");
+        }
     } else {
         log_error("Unhandled error: %s", error_message.c_str());
     }
@@ -612,7 +765,7 @@ void WebSocketClient::cleanup() {
     if (cleanup_complete.load()) return;
     cleanup_complete.store(true);
 
-    log_debug("cleanup: entered");
+    log_info("cleanup: entered");
 
     // Clean up events first
     if (ping_event) {
@@ -672,7 +825,7 @@ void WebSocketClient::cleanup() {
     upgraded.store(false);
     running.store(false);
 
-    log_debug("cleanup: exiting");
+    log_info("cleanup: exiting");
 }
 
 /**
@@ -700,6 +853,17 @@ void WebSocketClient::send(evbuffer* buf,
                          size_t raw_len,
                          MessageType type) 
 {
+    // Check if object is being destroyed
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("send: object is being destroyed, ignoring send request");
+        return;
+    }
+    
+    if (!buf) {
+        log_error("send: invalid evbuffer");
+        return;
+    }
+
     const bool is_control_frame = (type == MessageType::CLOSE || 
                                  type == MessageType::PING || 
                                  type == MessageType::PONG);
@@ -797,44 +961,57 @@ void WebSocketClient::send(evbuffer* buf,
 
     auto out = buf;
 
-    evbuffer_add(out, &b1, 1);
-    evbuffer_add(out, &b2, 1);
+    // Wrap evbuffer operations in try-catch to handle destroyed evbuffer
+    try {
+        // Double-check cleanup_complete before writing to evbuffer
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("send: object is being destroyed (checked before evbuffer_add), ignoring");
+            return;
+        }
 
-    // Extended payload length
-    if ((b2 & 0x7F) == 126) {
-        uint16_t len = htons(static_cast<uint16_t>(payload_len));
-        evbuffer_add(out, &len, 2);
-    } else if ((b2 & 0x7F) == 127) {
-        uint64_t len = htonll(static_cast<uint64_t>(payload_len));
-        evbuffer_add(out, &len, 8);
-    }
+        evbuffer_add(out, &b1, 1);
+        evbuffer_add(out, &b2, 1);
 
-    // Chunked masking implementation
-    uint8_t mask_key[4];
-    std::random_device rd;
-    std::uniform_int_distribution<uint8_t> distrib(0, 255);
-    for (int i = 0; i < 4; ++i) mask_key[i] = distrib(rd);
-    evbuffer_add(out, mask_key, 4);
+        // Extended payload length
+        if ((b2 & 0x7F) == 126) {
+            uint16_t len = htons(static_cast<uint16_t>(payload_len));
+            evbuffer_add(out, &len, 2);
+        } else if ((b2 & 0x7F) == 127) {
+            uint64_t len = htonll(static_cast<uint64_t>(payload_len));
+            evbuffer_add(out, &len, 8);
+        }
 
-    uint32_t mask_32;
-    memcpy(&mask_32, mask_key, 4);
-    
-    size_t i = 0;
-    const size_t aligned_len = payload_len & ~0x03;
-    const uint8_t* src = payload_ptr;
-    
-    // Process 32-bit chunks
-    for (; i < aligned_len; i += 4) {
-        uint32_t chunk;
-        memcpy(&chunk, src + i, 4);
-        chunk ^= mask_32;
-        evbuffer_add(out, &chunk, 4);
-    }
-    
-    // Process remaining bytes
-    for (; i < payload_len; ++i) {
-        uint8_t byte = src[i] ^ mask_key[i % 4];
-        evbuffer_add(out, &byte, 1);
+        // Chunked masking implementation
+        uint8_t mask_key[4];
+        std::random_device rd;
+        std::uniform_int_distribution<uint8_t> distrib(0, 255);
+        for (int i = 0; i < 4; ++i) mask_key[i] = distrib(rd);
+        evbuffer_add(out, mask_key, 4);
+
+        uint32_t mask_32;
+        memcpy(&mask_32, mask_key, 4);
+        
+        size_t i = 0;
+        const size_t aligned_len = payload_len & ~0x03;
+        const uint8_t* src = payload_ptr;
+        
+        // Process 32-bit chunks
+        for (; i < aligned_len; i += 4) {
+            uint32_t chunk;
+            memcpy(&chunk, src + i, 4);
+            chunk ^= mask_32;
+            evbuffer_add(out, &chunk, 4);
+        }
+        
+        // Process remaining bytes
+        for (; i < payload_len; ++i) {
+            uint8_t byte = src[i] ^ mask_key[i % 4];
+            evbuffer_add(out, &byte, 1);
+        }
+    } catch (const std::exception& e) {
+        log_error("Exception in send() when writing to evbuffer: %s", e.what());
+    } catch (...) {
+        log_error("Unknown exception in send() when writing to evbuffer");
     }
 }
 
@@ -1352,7 +1529,20 @@ void WebSocketClient::eventCallback(bufferevent* bev, short events, void* ctx) {
  */
 void WebSocketClient::pingCallback(evutil_socket_t /*fd*/, short /*event*/, void *arg) {
     WebSocketClient* client = static_cast<WebSocketClient*>(arg);
-    client->sendPing();
+    
+    // Check if object is being destroyed to prevent use-after-free
+    if (!client || client->cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("pingCallback: object is being destroyed, ignoring");
+        return;
+    }
+
+    try {
+        client->sendPing();
+    } catch (const std::exception& e) {
+        log_error("Exception in pingCallback: %s", e.what());
+    } catch (...) {
+        log_error("Unknown exception in pingCallback");
+    }
 }
 
 /**
@@ -1360,11 +1550,25 @@ void WebSocketClient::pingCallback(evutil_socket_t /*fd*/, short /*event*/, void
  */
 void WebSocketClient::timeoutCallback(evutil_socket_t /*fd*/, short /*event*/, void *arg) {
     WebSocketClient* client = static_cast<WebSocketClient*>(arg);
+    
+    // Check if object is being destroyed to prevent use-after-free
+    if (!client || client->cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("timeoutCallback: object is being destroyed, ignoring");
+        return;
+    }
 
-    auto state = client->connection_state.load(std::memory_order_acquire);
-    if (state != ConnectionState::CONNECTED && state != ConnectionState::FAILED) {
-        //log_error("Connection timeout");
-        client->sendError(ErrorCode::CONNECT_FAILED, "Connection timeout");
+    try {
+        auto state = client->connection_state.load(std::memory_order_acquire);
+        if (state != ConnectionState::CONNECTED && state != ConnectionState::FAILED) {
+            // Double-check cleanup_complete before calling sendError
+            if (!client->cleanup_complete.load(std::memory_order_acquire)) {
+                client->sendError(ErrorCode::CONNECT_FAILED, "Connection timeout");
+            }
+        }
+    } catch (const std::exception& e) {
+        log_error("Exception in timeoutCallback: %s", e.what());
+    } catch (...) {
+        log_error("Unknown exception in timeoutCallback");
     }
 }
 
@@ -1576,6 +1780,12 @@ bool WebSocketClient::containsHeader(const std::string& response, const std::str
  * 
  */
 void WebSocketClient::handleEvent(bufferevent* bev, short events) {
+    // Check if object is being destroyed FIRST - prevent all operations
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("handleEvent: object is being destroyed, ignoring events: %d", events);
+        return;
+    }
+    
     if (events & BEV_EVENT_CONNECTED) {
         log_debug("Connected to server");
 
@@ -1616,6 +1826,11 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
         sendHandshakeRequest();
 
     } else if (events & BEV_EVENT_ERROR) {
+        // Double-check cleanup_complete before processing error
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("handleEvent: object is being destroyed, ignoring BEV_EVENT_ERROR");
+            return;
+        }
         
         std::string message;
         ConnectionState new_state = ConnectionState::FAILED;
@@ -1627,7 +1842,10 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
                 ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
                 log_error("TLS error: %.240s", err_buf);
                 message = err_buf;
-                sendError(ErrorCode::SSL_ERROR, message);
+                // sendError() will check cleanup_complete internally, but check here too
+                if (!cleanup_complete.load(std::memory_order_acquire)) {
+                    sendError(ErrorCode::SSL_ERROR, message);
+                }
                 connection_state.store(new_state, std::memory_order_release);
                 return;
             }
@@ -1640,11 +1858,22 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
             ? formatSocketError(error_code)
             : "Connection error";
         log_error("%s", message.c_str());
-        sendError(ErrorCode::IO, message);
+        
+        // Only send error if not being destroyed (Broken pipe after EOF is normal)
+        if (!cleanup_complete.load(std::memory_order_acquire)) {
+            sendError(ErrorCode::IO, message);
+        } else {
+            log_debug("handleEvent: ignoring error '%s' because object is being destroyed", message.c_str());
+        }
 
         connection_state.store(new_state, std::memory_order_release);
         
     } else if (events & BEV_EVENT_EOF) {
+        // Double-check cleanup_complete before processing EOF
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("handleEvent: object is being destroyed, ignoring BEV_EVENT_EOF");
+            return;
+        }
 
         std::string message;
         int close_code = static_cast<int>(CloseCode::NORMAL);
@@ -1662,8 +1891,14 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
             callback = close_callback;
         }
 
-        if (callback) {
-            callback(close_code, message.empty() ? "Connection closed" : message);
+        if (callback && !cleanup_complete.load(std::memory_order_acquire)) {
+            try {
+                callback(close_code, message.empty() ? "Connection closed" : message);
+            } catch (const std::exception& e) {
+                log_error("Exception in close callback: %s", e.what());
+            } catch (...) {
+                log_error("Unknown exception in close callback");
+            }
         }
 
     } else {

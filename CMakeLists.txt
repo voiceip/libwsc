@@ -64,13 +64,9 @@ add_library(libwsc
 
 target_include_directories(libwsc
   PUBLIC
-<<<<<<< HEAD
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:include/libwsc>
   PRIVATE
-=======
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libwsc>
->>>>>>> 0460557 (Compile examples)
     ${LIBEVENT_INCLUDE_DIRS}
 )
 
